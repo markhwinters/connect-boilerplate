@@ -18,7 +18,18 @@ export const matchStatusEnum = pgEnum("match_status", [
   "rejected",
 ]);
 
-// ─── Users ────────────────────────────────────────────────────────────────────
+// ─── Default TTLs ─────────────────────────────────────────────────────────────
+
+/** Session lifetime — users auto-expire after this window */
+export const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/** Pending match TTL */
+export const PENDING_MATCH_TTL_MS = 1 * 60 * 60 * 1000; // 1 hour
+
+/** Mutual match TTL — longer so both users have time to connect */
+export const MUTUAL_MATCH_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// ─── Users (ephemeral sessions) ───────────────────────────────────────────────
 
 export const users = pgTable(
   "users",
@@ -28,19 +39,18 @@ export const users = pgTable(
     displayName: varchar("display_name", { length: 100 }).notNull(),
     role: userRoleEnum("role").notNull(),
     jobTitle: varchar("job_title", { length: 100 }),
-    // Max 10 keywords enforced at application layer (Arcjet + validation)
     keywords: text("keywords").array().notNull().default([]),
     createdAt: timestamp("created_at").defaultNow().notNull(),
-    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
   },
   (table) => ({
-    // GIN index for efficient keyword array intersection queries
     keywordsIdx: index("users_keywords_idx").on(table.keywords),
     roleIdx: index("users_role_idx").on(table.role),
-  })
+    expiresIdx: index("users_expires_idx").on(table.expiresAt),
+  }),
 );
 
-// ─── Matches ──────────────────────────────────────────────────────────────────
+// ─── Matches (self-destructing) ───────────────────────────────────────────────
 
 export const matches = pgTable(
   "matches",
@@ -55,12 +65,13 @@ export const matches = pgTable(
     status: matchStatusEnum("status").notNull().default("pending"),
     sharedKeywords: text("shared_keywords").array().notNull().default([]),
     createdAt: timestamp("created_at").defaultNow().notNull(),
-    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
   },
   (table) => ({
     initiatorIdx: index("matches_initiator_idx").on(table.initiatorId),
     receiverIdx: index("matches_receiver_idx").on(table.receiverId),
-  })
+    expiresIdx: index("matches_expires_idx").on(table.expiresAt),
+  }),
 );
 
 // ─── Relations ────────────────────────────────────────────────────────────────

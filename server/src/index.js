@@ -3,17 +3,20 @@ import http from "http";
 import express from "express";
 import helmet from "helmet";
 import cors from "cors";
-import { WebSocketServer } from "ws";
 import { router as apiRouter } from "./routes/api.js";
 import { createWebSocketServer } from "./ws/server.js";
 import { wsUpgradeProtection } from "./middleware/arcjet.js";
-import { pool } from "./db/client.js";
-import { closeRedis } from "./lib/redis.js";
+import { pool, db } from "./db/client.js";
+import { users, matches } from "./db/schema.js";
+import { connectRedis, closeRedis } from "./lib/redis.js";
+import { lt } from "drizzle-orm";
 
 const PORT = process.env.PORT || 3001;
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "http://localhost:5173")
   .split(",")
   .map((o) => o.trim());
+
+const CLEANUP_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
 
 // ─── Express app ──────────────────────────────────────────────────────────────
 
@@ -26,12 +29,10 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json({ limit: "50kb" })); // keep request bodies small
+app.use(express.json({ limit: "50kb" }));
 
-// Mount REST API
 app.use("/api", apiRouter);
 
-// 404 fallback for unmatched routes
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found" });
 });
@@ -42,48 +43,54 @@ const server = http.createServer(app);
 
 // ─── WebSocket upgrade with Arcjet protection ─────────────────────────────────
 
-server.on("upgrade", async (req, socket, head) => {
-  // Only accept upgrades on /ws
-  if (req.url !== "/ws") {
-    socket.destroy();
-    return;
-  }
-
-  try {
-    // Arcjet protect() expects a req-like object with ip
-    const decision = await wsUpgradeProtection.protect(req, {
-      ip: req.socket.remoteAddress,
+server.on("upgrade", (req, socket, head) => {
+  console.log(`[Server] Upgrade request for ${req.url}`);
+  // Simple check for the /ws path
+  if (req.url && req.url.startsWith("/ws")) {
+    console.log(`[Server] Accepting WS upgrade for ${req.url}`);
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
     });
+  } else {
+    console.warn(`[Server] Denying WS upgrade for ${req.url}`);
+    socket.destroy();
+  }
+});
 
-    if (decision.isDenied()) {
-      const msg = decision.reason.isBot()
-        ? "HTTP/1.1 403 Forbidden\r\n\r\n"
-        : "HTTP/1.1 429 Too Many Requests\r\n\r\n";
-      socket.write(msg);
-      socket.destroy();
-      return;
+// ─── Ephemeral cleanup ───────────────────────────────────────────────────────
+
+/**
+ * Periodically delete expired users and matches.
+ * Users cascade-delete their matches, so we clean users first.
+ */
+async function cleanupExpired() {
+  try {
+    const now = new Date();
+
+    const deletedMatches = await db
+      .delete(matches)
+      .where(lt(matches.expiresAt, now))
+      .returning({ id: matches.id });
+
+    const deletedUsers = await db
+      .delete(users)
+      .where(lt(users.expiresAt, now))
+      .returning({ id: users.id });
+
+    if (deletedUsers.length || deletedMatches.length) {
+      console.log(
+        `[Cleanup] Removed ${deletedUsers.length} expired users, ${deletedMatches.length} expired matches`
+      );
     }
   } catch (err) {
-    // If Arcjet is misconfigured, fail open in dev / fail closed in prod
-    console.error("[Arcjet] WS upgrade check failed", err);
-    if (process.env.NODE_ENV === "production") {
-      socket.destroy();
-      return;
-    }
+    console.error("[Cleanup] Error during cleanup", err);
   }
-
-  // Hand off to WS server (attached below)
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
-});
+}
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-// Attach WS server — noServer: true because we handle upgrade manually above
 const wss = createWebSocketServer(server);
 
-// Verify DB connectivity before accepting traffic
 async function start() {
   try {
     await pool.query("SELECT 1");
@@ -93,10 +100,24 @@ async function start() {
     process.exit(1);
   }
 
-  server.listen(PORT, () => {
-    console.log(`[Server] Listening on http://localhost:${PORT}`);
-    console.log(`[Server] WebSocket on ws://localhost:${PORT}/ws`);
+  try {
+    await connectRedis();
+  } catch (err) {
+    console.error("[Redis] Failed to connect:", err.message);
+    if (process.env.NODE_ENV === "production") process.exit(1);
+    console.warn("[Redis] Continuing without Redis in dev mode");
+  }
+
+  // Run initial cleanup, then schedule periodic cleanup
+  cleanupExpired();
+  const cleanupTimer = setInterval(cleanupExpired, CLEANUP_INTERVAL_MS);
+  cleanupTimer.unref(); // don't keep process alive just for cleanup
+
+  server.listen(PORT, "127.0.0.1", () => {
+    console.log(`[Server] Listening on http://127.0.0.1:${PORT}`);
+    console.log(`[Server] WebSocket on ws://127.0.0.1:${PORT}/ws`);
     console.log(`[Server] Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
+    console.log(`[Server] Cleanup interval: ${CLEANUP_INTERVAL_MS / 60_000}min`);
   });
 }
 
@@ -113,7 +134,6 @@ async function shutdown(signal) {
     process.exit(0);
   });
 
-  // Force exit after 10s if connections hang
   setTimeout(() => {
     console.error("[Server] Forced exit after timeout");
     process.exit(1);

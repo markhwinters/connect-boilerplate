@@ -1,6 +1,6 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { v4 as uuidv4 } from "uuid";
-import { subscriber, publisher } from "../lib/redis.js";
+import { subscriber, publisher, setOnlineUser, removeOnlineUser } from "../lib/redis.js";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const REDIS_CHANNEL = "connect-talent:ws";
@@ -16,20 +16,20 @@ const rooms = new Map();
 /** @type {Map<string, string>} socketId → userId */
 const socketUserMap = new Map();
 
+/** @type {Map<string, string>} userId → socketId (reverse lookup for push notifications) */
+const userSocketMap = new Map();
+
 // ─── Redis backplane ──────────────────────────────────────────────────────────
 
-// Subscribe once; handle all inbound cross-server messages
-subscriber.subscribe(REDIS_CHANNEL, (err) => {
-  if (err) console.error("[WS] Redis subscribe error", err);
-  else console.log(`[WS] Subscribed to Redis channel: ${REDIS_CHANNEL}`);
-});
+async function initRedisSubscription() {
+  await subscriber.subscribe(REDIS_CHANNEL);
+  console.log(`[WS] Subscribed to Redis channel: ${REDIS_CHANNEL}`);
+}
 
-subscriber.on("message", (channel, raw) => {
-  if (channel !== REDIS_CHANNEL) return;
-
+subscriber.on("message", (_channel, raw) => {
   try {
     const { roomId, senderId, payload } = JSON.parse(raw);
-    broadcastToRoom(roomId, payload, senderId, false); // false = local only, no re-publish
+    broadcastToRoom(roomId, payload, senderId, false);
   } catch (err) {
     console.error("[WS] Failed to parse Redis message", err);
   }
@@ -44,12 +44,20 @@ function send(ws, payload) {
 }
 
 /**
- * Broadcast to all sockets in a room.
- * @param {string} roomId
- * @param {object} payload
- * @param {string|null} excludeSocketId - skip this socket (the sender)
- * @param {boolean} publish - whether to also publish to Redis for other servers
+ * Send a message directly to a specific user by userId.
+ * Used for push notifications (e.g., mutual match alerts).
  */
+export function sendToUser(userId, payload) {
+  const socketId = userSocketMap.get(userId);
+  if (!socketId) return false;
+  const ws = clients.get(socketId);
+  if (ws) {
+    send(ws, payload);
+    return true;
+  }
+  return false;
+}
+
 function broadcastToRoom(roomId, payload, excludeSocketId = null, publish = true) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -83,11 +91,6 @@ function leaveAllRooms(socketId) {
 
 // ─── Message handlers ─────────────────────────────────────────────────────────
 
-/**
- * Route inbound WS messages by type.
- * All WebRTC signaling (offer, answer, ice-candidate) is just forwarded
- * to the correct room — the server never inspects the SDP payload.
- */
 function handleMessage(socketId, raw) {
   let msg;
   try {
@@ -100,14 +103,17 @@ function handleMessage(socketId, raw) {
   const { type, roomId, userId, payload } = msg;
 
   switch (type) {
-    // Client identifies itself after connection
     case "identify": {
       socketUserMap.set(socketId, userId);
+      userSocketMap.set(userId, socketId);
+      // Mark user online in Redis with TTL
+      setOnlineUser(userId).catch((err) =>
+        console.error("[WS] Failed to set online status", err)
+      );
       console.log(`[WS] Socket ${socketId} identified as user ${userId}`);
       break;
     }
 
-    // Join a match room (called after mutual match confirmed)
     case "join-room": {
       if (!roomId) return;
       joinRoom(socketId, roomId);
@@ -115,8 +121,7 @@ function handleMessage(socketId, raw) {
       break;
     }
 
-    // ── WebRTC Signaling ─────────────────────────────────────────────────────
-    // Server is a dumb relay — it never reads offer/answer/ICE content.
+    // WebRTC signaling — server is a dumb relay
     case "webrtc-offer":
     case "webrtc-answer":
     case "webrtc-ice-candidate": {
@@ -125,15 +130,19 @@ function handleMessage(socketId, raw) {
       break;
     }
 
-    // Generic chat message within a match room
+    // Ephemeral chat — relay only, never stored
     case "chat-message": {
       if (!roomId) return;
-      broadcastToRoom(roomId, {
-        type: "chat-message",
-        from: socketUserMap.get(socketId),
-        payload,
-        ts: Date.now(),
-      }, socketId);
+      broadcastToRoom(
+        roomId,
+        {
+          type: "chat-message",
+          from: socketUserMap.get(socketId),
+          payload,
+          ts: Date.now(),
+        },
+        socketId
+      );
       break;
     }
 
@@ -161,18 +170,13 @@ function setupHeartbeat(wss) {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
-/**
- * Attach the WebSocket server to an existing HTTP server.
- * Arcjet WS upgrade protection is applied in index.js before this runs.
- *
- * @param {import('http').Server} httpServer
- */
 export function createWebSocketServer(httpServer) {
-  // noServer: true — we handle the HTTP upgrade event manually in index.js
-  // so Arcjet protection runs before the WS handshake completes.
   const wss = new WebSocketServer({ noServer: true });
 
   setupHeartbeat(wss);
+  initRedisSubscription().catch((err) =>
+    console.error("[WS] Redis subscription failed", err)
+  );
 
   wss.on("connection", (ws, req) => {
     const socketId = uuidv4();
@@ -180,12 +184,15 @@ export function createWebSocketServer(httpServer) {
     clients.set(socketId, ws);
 
     console.log(`[WS] New connection: ${socketId} from ${req.socket.remoteAddress}`);
-
-    // Acknowledge connection
     send(ws, { type: "connected", socketId });
 
     ws.on("pong", () => {
       ws.isAlive = true;
+      // Refresh online status on each pong
+      const userId = socketUserMap.get(socketId);
+      if (userId) {
+        setOnlineUser(userId).catch(() => {});
+      }
     });
 
     ws.on("message", (data) => {
@@ -194,8 +201,13 @@ export function createWebSocketServer(httpServer) {
 
     ws.on("close", (code, reason) => {
       console.log(`[WS] Socket ${socketId} closed: ${code} ${reason}`);
+      const userId = socketUserMap.get(socketId);
       clients.delete(socketId);
       socketUserMap.delete(socketId);
+      if (userId) {
+        userSocketMap.delete(userId);
+        removeOnlineUser(userId).catch(() => {});
+      }
       leaveAllRooms(socketId);
     });
 
