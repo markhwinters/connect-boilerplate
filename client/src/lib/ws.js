@@ -78,6 +78,14 @@ export function sendChat(roomId, text) {
   send({ type: 'chat-message', roomId, payload: { text } });
 }
 
+export function sendTyping(roomId, isTyping) {
+  send({ type: 'typing', roomId, payload: { isTyping } });
+}
+
+export function sendReadReceipt(roomId, messageId) {
+  send({ type: 'message-read', roomId, payload: { messageId } });
+}
+
 export function sendWebRTCOffer(roomId, payload) {
   send({ type: 'webrtc-offer', roomId, payload });
 }

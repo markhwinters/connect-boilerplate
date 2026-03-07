@@ -60,7 +60,7 @@ export default function Profile() {
       {/* Profile header card */}
       <GlassCard className="text-center relative overflow-hidden">
         {/* Background gradient */}
-        <div className="absolute inset-0 bg-gradient-to-b from-accent-violet/5 to-transparent pointer-events-none" />
+        <div className="absolute inset-0 bg-linear-to-b from-accent-violet/5 to-transparent pointer-events-none" />
 
         <div className="relative z-10">
           <div className="w-20 h-20 mx-auto rounded-full gradient-bg flex items-center justify-center text-white text-3xl font-bold mb-4 shadow-lg shadow-accent-violet/20">
@@ -179,7 +179,7 @@ export default function Profile() {
         )}
 
         <button
-          onClick={() => { logout(); navigate('/'); }}
+          onClick={handleDelete}
           className="w-full glass glass-hover text-zinc-400 hover:text-white font-medium py-3 rounded-xl transition-all flex items-center justify-center gap-2"
         >
           <LogOut className="w-4 h-4" />

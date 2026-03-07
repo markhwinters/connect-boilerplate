@@ -42,6 +42,22 @@ router.post("/users", arcjetMiddleware(profileUpdateProtection), async (req, res
 
     const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
 
+    // Check if user already exists and session is active
+    const [existingUser] = await db
+      .select()
+      .from(users)
+      .where(and(eq(users.email, email), gt(users.expiresAt, new Date())));
+
+    if (existingUser) {
+      console.log(`[POST /users] Resuming session for: ${email}`);
+      const [updated] = await db
+        .update(users)
+        .set({ displayName, role, jobTitle, keywords, expiresAt })
+        .where(eq(users.id, existingUser.id))
+        .returning();
+      return res.status(200).json(updated);
+    }
+
     const [user] = await db
       .insert(users)
       .values({ email, displayName, role, jobTitle, keywords, expiresAt })
@@ -50,6 +66,7 @@ router.post("/users", arcjetMiddleware(profileUpdateProtection), async (req, res
     res.status(201).json(user);
   } catch (err) {
     if (err.code === "23505") {
+      // This should ideally not happen now with the check above, but keep for safety
       return res.status(409).json({ error: "Email already registered" });
     }
     console.error("[POST /users]", err);

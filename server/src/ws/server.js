@@ -1,6 +1,11 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { v4 as uuidv4 } from "uuid";
-import { subscriber, publisher, setOnlineUser, removeOnlineUser } from "../lib/redis.js";
+import {
+  subscriber,
+  publisher,
+  setOnlineUser,
+  removeOnlineUser,
+} from "../lib/redis.js";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const REDIS_CHANNEL = "connect-talent:ws";
@@ -58,7 +63,12 @@ export function sendToUser(userId, payload) {
   return false;
 }
 
-function broadcastToRoom(roomId, payload, excludeSocketId = null, publish = true) {
+function broadcastToRoom(
+  roomId,
+  payload,
+  excludeSocketId = null,
+  publish = true,
+) {
   const room = rooms.get(roomId);
   if (!room) return;
 
@@ -71,7 +81,7 @@ function broadcastToRoom(roomId, payload, excludeSocketId = null, publish = true
   if (publish) {
     publisher.publish(
       REDIS_CHANNEL,
-      JSON.stringify({ roomId, senderId: excludeSocketId, payload })
+      JSON.stringify({ roomId, senderId: excludeSocketId, payload }),
     );
   }
 }
@@ -108,7 +118,7 @@ function handleMessage(socketId, raw) {
       userSocketMap.set(userId, socketId);
       // Mark user online in Redis with TTL
       setOnlineUser(userId).catch((err) =>
-        console.error("[WS] Failed to set online status", err)
+        console.error("[WS] Failed to set online status", err),
       );
       console.log(`[WS] Socket ${socketId} identified as user ${userId}`);
       break;
@@ -121,12 +131,11 @@ function handleMessage(socketId, raw) {
       break;
     }
 
-    // WebRTC signaling — server is a dumb relay
     case "webrtc-offer":
     case "webrtc-answer":
     case "webrtc-ice-candidate": {
       if (!roomId) return;
-      broadcastToRoom(roomId, { type, payload }, socketId);
+      broadcastToRoom(roomId, { type, payload, from: socketUserMap.get(socketId) }, socketId);
       break;
     }
 
@@ -141,7 +150,37 @@ function handleMessage(socketId, raw) {
           payload,
           ts: Date.now(),
         },
-        socketId
+        socketId,
+      );
+      break;
+    }
+
+    case "typing": {
+      if (!roomId) return;
+      broadcastToRoom(
+        roomId,
+        {
+          type: "typing",
+          roomId,
+          from: socketUserMap.get(socketId),
+          isTyping: payload.isTyping,
+        },
+        socketId,
+      );
+      break;
+    }
+
+    case "message-read": {
+      if (!roomId) return;
+      broadcastToRoom(
+        roomId,
+        {
+          type: "message-read",
+          roomId,
+          from: socketUserMap.get(socketId),
+          messageId: payload.messageId,
+        },
+        socketId,
       );
       break;
     }
@@ -175,7 +214,7 @@ export function createWebSocketServer(httpServer) {
 
   setupHeartbeat(wss);
   initRedisSubscription().catch((err) =>
-    console.error("[WS] Redis subscription failed", err)
+    console.error("[WS] Redis subscription failed", err),
   );
 
   wss.on("connection", (ws, req) => {
@@ -183,7 +222,9 @@ export function createWebSocketServer(httpServer) {
     ws.isAlive = true;
     clients.set(socketId, ws);
 
-    console.log(`[WS] New connection: ${socketId} from ${req.socket.remoteAddress}`);
+    console.log(
+      `[WS] New connection: ${socketId} from ${req.socket.remoteAddress}`,
+    );
     send(ws, { type: "connected", socketId });
 
     ws.on("pong", () => {

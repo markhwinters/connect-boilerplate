@@ -33,9 +33,23 @@ export function useWebSocket(userId, handlers = {}) {
     ws.sendChat(roomId, text);
   }, []);
 
+  const sendTyping = useCallback((roomId, isTyping) => {
+    ws.sendTyping(roomId, isTyping);
+  }, []);
+
+  const sendReadReceipt = useCallback((roomId, messageId) => {
+    ws.sendReadReceipt(roomId, messageId);
+  }, []);
+
   const joinRoom = useCallback((roomId) => {
     ws.joinRoom(roomId);
   }, []);
 
-  return { sendMessage, joinRoom, isConnected: ws.isConnected };
+  return { 
+    sendMessage, 
+    sendTyping, 
+    sendReadReceipt, 
+    joinRoom, 
+    isConnected: ws.isConnected 
+  };
 }
